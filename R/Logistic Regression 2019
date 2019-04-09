@@ -1,0 +1,166 @@
+# Load Libraries -------
+library(data.table)
+library(readr) 
+library(dplyr) 
+library(tidyr) 
+library(reshape)
+library(tidyverse)
+library(gridExtra)
+library(magrittr)
+
+# Load Data and Set Working Directory -----------
+setwd('C:/Users/matth/Desktop/mens-machine-learning-competition-2019')
+
+seasons <- read_csv("./DataFiles/Seasons.csv")
+teams <- read_csv("./DataFiles/Teams.csv")
+tourney_compact_df <- read_csv("./DataFiles/NCAATourneyCompactResults.csv")
+seeds <- read_csv("./DataFiles/NCAATourneySeeds.csv")
+submission <- read_csv("./SampleSubmissionStage1.csv")
+Massey_ordinals <- read_csv('./MasseyOrdinals/MasseyOrdinals.csv')
+tourney_seeds <- fread("./DataFiles/NCAATourneySeeds.csv")
+tourney_slots <- fread("./DataFiles/NCAATourneySlots.csv")
+tourney_seed_round_slot <- read_csv("./DataFiles/NCAATourneySeedRoundSlots.csv")
+team_coaches <- read_csv('./DataFiles/TeamCoaches.csv')
+Massey_ordinals_2019 <- read_csv('./MasseyOrdinals/MasseyOrdinals_2019_Only_Day_133_52_Systems.csv')
+massey <- rbind(Massey_ordinals, Massey_ordinals_2019) %>% 
+  spread(key = SystemName, value = OrdinalRank)
+
+massey_133 <- massey[massey$RankingDayNum == 133, ]   
+
+# Take the mean of all massey rankings ----
+massey_133$Mean <- rowMeans(massey_133[, 3:ncol(massey_133)], na.rm=TRUE) 
+
+massey_133 <- massey_133[,c("Season","TeamID","Mean")] %>% 
+  mutate(OrdinalRankScore = 100 - 4*log(Mean+1) - Mean/22) %>% 
+  select(-Mean)
+
+train <- tourney_compact_df %>% 
+  select(Season, DayNum, WTeamID, LTeamID) %>% 
+  mutate(team_id_diff = WTeamID - LTeamID,
+         Team1 = if_else(team_id_diff < 0, WTeamID, LTeamID),
+         Team2 = if_else(team_id_diff > 0, WTeamID, LTeamID),
+         result = if_else(WTeamID == Team1, 1, 0)) %>% 
+  select(Season, DayNum, Team1, Team2, result) %>%
+  subset(Season >= 2010 & Season <= 2018)
+
+train <- train %>% 
+  left_join(massey_133, by = c("Season", "Team1" = "TeamID")) %>%
+  left_join(massey_133, by = c("Season", "Team2" = "TeamID")) 
+
+# Find tournament slots & rounds data ----
+tourney_seeds[, c('Region', 'Seed_int'):=.(substr(Seed, 1, 1), as.integer(substr(Seed, 2, 3)))]
+setnames(tourney_slots, 3:4, c('Seed1', 'Seed2'))
+tourney_slots[, Round:=as.integer(substr(Slot, 2, 2))]
+
+# Round 0 = First Four
+tourney_slots[nchar(Slot)==3, Round:=0L]
+round0 <- tourney_seeds[grepl('a|b', Seed)]
+round0[, Seed:=gsub('a|b', '', Seed)]
+tourney_seeds <- rbind(tourney_seeds, round0)
+rm(round0)
+
+# Round 1
+slots <- merge(tourney_slots, tourney_seeds, by.x=c('Season', 'Seed1'), by.y=c('Season', 'Seed'), all.x=T)
+slots <- merge(slots, tourney_seeds, by.x=c('Season', 'Seed2'), by.y=c('Season', 'Seed'), all.x=T, suffix=c('1', '2'))
+slots <- rbind(slots[!is.na(TeamID1), .(Season, Slot, Seed1, Seed2, TeamID1, TeamID2, Round)]
+               , slots[!is.na(TeamID1), .(Season, Slot, Seed1=Seed2, TeamID1=TeamID2, Seed2=Seed1, TeamID2=TeamID1, Round)], use.names=T)
+
+# Round 2-6
+for (r in 2:6){
+  temp <- merge(tourney_slots[Round==r, .(Season, Slot, Seed=Seed1)], slots[, .(Season, Seed=Slot, Seed1, TeamID1)], by=c('Season', 'Seed'), allow.cartesian = T)
+  temp2 <- merge(tourney_slots[Round==r, .(Season, Slot, Seed=Seed2)], slots[, .(Season, Seed=Slot, Seed2, TeamID2)], by=c('Season', 'Seed'), allow.cartesian = T)
+  
+  slots2 <- merge(temp[, !'Seed', with=F], temp2[, !'Seed', with=F], by=c('Season', 'Slot'), allow.cartesian = T)
+  slots2 <- rbind(slots2, slots2[, .(Season, Slot, Seed1=Seed2, TeamID1=TeamID2, Seed2=Seed1, TeamID2=TeamID1)], use.names=T)
+  slots2[, Round:=r]
+  
+  slots <- rbind(slots, slots2, use.names=T)
+  rm(temp, temp2, slots2); gc()
+  slots <- unique(slots)
+}
+
+train <- train %>% 
+  left_join(slots[,c(1,5:7)], by = c("Season", "Team1" = "TeamID1", "Team2" = "TeamID2"))
+
+# Analyze seed differences ----
+tourney_seeds_data <- read_csv('./DataFiles/NCAATourneySeeds.csv') %>% 
+  mutate(Region = str_sub(Seed, 1, 1),
+         Seed_int = as.integer(str_sub(Seed, 2, 3)))
+
+train <- train %>% 
+  left_join(tourney_seeds_data[,c(1,3,5)], by = c('Season', 'Team1' = 'TeamID')) %>% 
+  left_join(tourney_seeds_data[,c(1,3,5)], by = c('Season', 'Team2' = 'TeamID')) %>% 
+  mutate(seed_difference = Seed_int.x - Seed_int.y)
+
+# Create and fit the logistic regression model ----
+fit <- glm(result ~ 
+            OrdinalRankScore.x 
+            + OrdinalRankScore.y 
+            + Seed_int.x
+            + Seed_int.y
+            #+ seed_difference
+            + Round 
+            #+ Season 
+            + OrdinalRankScore.y * Seed_int.y
+            #+ OrdinalRankScore.y * Round 
+            + OrdinalRankScore.x * Seed_int.x
+            #+ OrdinalRankScore.x * Round
+            #+ Seed_int.y * Round
+            #+ Seed_int.x * Round
+            + Seed_int.y * seed_difference
+            + Seed_int.x * seed_difference
+            + Round * Season
+            
+            #+ CoachName
+             #+ Yrs_Coaching_XP
+             ,
+           data = train, 
+           family = "binomial")
+summary(fit)
+
+# Creat test predictions ----
+setwd('C:/Users/matth/Desktop/mens-machine-learning-competition-2019')
+test <- read.csv("./SampleSubmissionStage2.csv", stringsAsFactors = FALSE) %>% 
+  select(ID) %>% 
+  separate(ID, sep = "_", into = c("Season", "Team1", "Team2"), convert = TRUE) %>%
+  left_join(massey_133, by = c("Season", "Team1" = "TeamID")) %>%
+  left_join(massey_133, by = c("Season", "Team2" = "TeamID")) %>% 
+  left_join(slots[,c(1,5:7)], by = c('Season', 'Team1' = "TeamID1", 'Team2' = "TeamID2")) %>% 
+  left_join(tourney_seeds_data[,c(1,3,5)], by = c('Season', 'Team1' = 'TeamID')) %>% 
+  left_join(tourney_seeds_data[,c(1,3,5)], by = c('Season', 'Team2' = 'TeamID')) %>% 
+  mutate(seed_difference = Seed_int.x - Seed_int.y)
+test$Pred <- predict(fit, test, type = "response")
+
+#write to file
+submitR1 <- test %>% 
+  select(Season, Team1, Team2, Pred) %>%
+  unite("ID", Season, Team1, Team2, sep = "_")
+
+submitR1 <- submitR1 %>% 
+  mutate(Pred = ifelse(ID == "2019_1125_1396", 1, Pred),
+         Pred = ifelse(ID == "2019_1192_1341", 1, Pred),
+         Pred = ifelse(ID == "2019_1295_1300", 1, Pred),
+         Pred = ifelse(ID == "2019_1113_1385", 1, Pred))
+
+# Output predictions and graph in NCAA bracket style ----
+setwd('C:/Users/matth/Documents/R/win-library/3.5/kaggleNCAA')
+write.csv(submitR1, 'massey_seed_R2.csv', row.names = FALSE)
+
+set.seed(11)
+#devtools::install_github('zachmayer/kaggleNCAA', force = TRUE)
+library('kaggleNCAA')
+# You MUST move your submission file into the kaggleNCAA package folder location!!
+f <- system.file('massey_seed_R2.csv', package = 'kaggleNCAA')
+dat <- parseBracket(f)
+sim <- simTourney(dat, 5, year = 2019, progress=TRUE)
+bracket <- extractBracket(sim)
+printableBracket(bracket)
+
+# Create unique output filename
+output_filename <- '2019_round_season_massey_seed_5.jpeg'
+
+# Open the file for the plot to be written to
+jpeg(output_filename, height = 2400, width = 3200, res = 300, quality = 400)
+
+printableBracket(bracket)
+dev.off()
